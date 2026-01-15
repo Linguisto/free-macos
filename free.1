@@ -1,0 +1,75 @@
+.TH FREE 1 "2026-01-15" "free-macos 0.1.0" "User Commands"
+.SH NAME
+free \- Linux-like memory summary for macOS
+.SH SYNOPSIS
+.B free
+[\-h]
+[\-b|\-k|\-m|\-g]
+[\-w]
+[\-t]
+[\-s \fISECONDS\fR]
+[\-c \fICOUNT\fR]
+[\-\-details]
+[\-\-version]
+[\-\-help]
+.SH DESCRIPTION
+.B free
+prints a summary of memory and swap usage on macOS in a format similar to GNU
+.BR free (1)
+on Linux.
+.PP
+The output is an approximation based on macOS memory accounting. Values may differ
+from Linux
+.BR free (1)
+because macOS classifies and manages memory differently.
+.SH OPTIONS
+.TP
+.B \-h
+Human-readable output (default).
+.TP
+.B \-b
+Show output in bytes.
+.TP
+.B \-k
+Show output in kibibytes.
+.TP
+.B \-m
+Show output in mebibytes.
+.TP
+.B \-g
+Show output in gibibytes.
+.TP
+.B \-w
+Wide output (accepted for GNU free compatibility).
+.TP
+.B \-t
+Display a line with totals (Mem + Swap).
+.TP
+.BI "\-s " SECONDS
+Repeat printing every
+.I SECONDS
+seconds.
+.TP
+.BI "\-c " COUNT
+Repeat count with
+.BR \-s .
+A value of 0 means repeat forever.
+.TP
+.B \-\-details
+Print an additional macOS-specific breakdown line (wired, compressed, active, inactive, etc.).
+.TP
+.B \-\-version
+Show version and exit.
+.TP
+.B \-\-help
+Show help and exit.
+.SH OUTPUT
+The main table contains:
+.TP
+.B total
+Total physical memory (or swap).
+.TP
+.B used
+Approximate used memory excluding reclaimable cache.
+.TP
+.B fr

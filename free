@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+import argparse
+import os
+import re
+import subprocess
+import sys
+import time
+from typing import Dict, Tuple
+
+VERSION = "0.1.0"
+
+def run(cmd: list[str]) -> str:
+    env = os.environ.copy()
+    # Force stable English output for parsing
+    env["LC_ALL"] = "C"
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True)
+    if p.returncode != 0:
+        raise RuntimeError(f"Command failed: {' '.join(cmd)}\n{p.stderr.strip()}")
+    return p.stdout
+
+def sysctl_value(name: str) -> str:
+    return run(["sysctl", "-n", name]).strip()
+
+def parse_vm_stat(text: str) -> Tuple[int, Dict[str, int]]:
+    lines = text.splitlines()
+    m = re.search(r"page size of (\d+) bytes", lines[0])
+    if not m:
+        raise ValueError("Unable to parse page size from vm_stat output")
+    page_size = int(m.group(1))
+
+    def grab(label: str) -> int:
+        pat = rf"^Pages {re.escape(label)}:\s+(\d+)\."
+        for ln in lines:
+            mm = re.match(pat, ln)
+            if mm:
+                return int(mm.group(1))
+        return 0
+
+    pages = {
+        "free": grab("free"),
+        "active": grab("active"),
+        "inactive": grab("inactive"),
+        "speculative": grab("speculative"),
+        "wired": grab("wired down"),
+        "purgeable": grab("purgeable"),
+        "compressor": grab("occupied by compressor"),
+    }
+    return page_size, pages
+
+def parse_swap_usage(text: str) -> Tuple[int, int, int]:
+    # Example: "total = 1024.00M  used = 0.00M  free = 1024.00M  (encrypted)"
+    def to_bytes(num: float, unit: str) -> int:
+        unit = unit.upper()
+        mult = {"K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}.get(unit, 1)
+        return int(num * mult)
+
+    m_total = re.search(r"total\s*=\s*([\d.]+)\s*([KMGT])", text, re.IGNORECASE)
+    m_used  = re.search(r"used\s*=\s*([\d.]+)\s*([KMGT])", text, re.IGNORECASE)
+    m_free  = re.search(r"free\s*=\s*([\d.]+)\s*([KMGT])", text, re.IGNORECASE)
+    if not (m_total and m_used and m_free):
+        return 0, 0, 0
+
+    total_b = to_bytes(float(m_total.group(1)), m_total.group(2))
+    used_b  = to_bytes(float(m_used.group(1)),  m_used.group(2))
+    free_b  = to_bytes(float(m_free.group(1)),  m_free.group(2))
+    return total_b, used_b, free_b
+
+def fmt(bytes_val: int, unit: str, human: bool) -> str:
+    if unit == "b":
+        return str(bytes_val)
+    if unit == "k":
+        return f"{bytes_val // 1024}"
+    if unit == "m":
+        return f"{bytes_val // (1024**2)}"
+    if unit == "g":
+        return f"{bytes_val / (1024**3):.1f}" if human else f"{bytes_val // (1024**3)}"
+
+    gib = bytes_val / (1024**3)
+    if gib >= 10:
+        return f"{gib:.0f}Gi"
+    if gib >= 1:
+        return f"{gib:.1f}Gi"
+    mib = bytes_val / (1024**2)
+    if mib >= 10:
+        return f"{mib:.0f}Mi"
+    return f"{mib:.1f}Mi"
+
+def snapshot() -> Dict[str, int]:
+    total_mem = int(sysctl_value("hw.memsize"))
+    page_size, p = parse_vm_stat(run(["vm_stat"]))
+
+    free_b = p["free"] * page_size
+    cache_b = (p["inactive"] + p["speculative"] + p["purgeable"]) * page_size
+
+    used_b = total_mem - free_b - cache_b
+    if used_b < 0:
+        used_b = 0
+
+    avail_b = min(total_mem, free_b + cache_b)
+
+    swap_total, swap_used, swap_free = parse_swap_usage(run(["sysctl", "vm.swapusage"]))
+
+    details = {
+        "wired_b": p["wired"] * page_size,
+        "compressed_b": p["compressor"] * page_size,
+        "active_b": p["active"] * page_size,
+        "inactive_b": p["inactive"] * page_size,
+        "speculative_b": p["speculative"] * page_size,
+        "purgeable_b": p["purgeable"] * page_size,
+    }
+
+    return {
+        "mem_total": total_mem,
+        "mem_used": used_b,
+        "mem_free": free_b,
+        "mem_cache": cache_b,
+        "mem_avail": avail_b,
+        "swap_total": swap_total,
+        "swap_used": swap_used,
+        "swap_free": swap_free,
+        **details,
+    }
+
+def print_table(s: Dict[str, int], unit: str, human: bool, show_total: bool, show_details: bool) -> None:
+    headers = ["", "total", "used", "free", "shared", "buff/cache", "available"]
+
+    mem_row = [
+        "Mem:",
+        fmt(s["mem_total"], unit, human),
+        fmt(s["mem_used"], unit, human),
+        fmt(s["mem_free"], unit, human),
+        fmt(0, unit, human),
+        fmt(s["mem_cache"], unit, human),
+        fmt(s["mem_avail"], unit, human),
+    ]
+
+    swap_row = [
+        "Swap:",
+        fmt(s["swap_total"], unit, human),
+        fmt(s["swap_used"], unit, human),
+        fmt(s["swap_free"], unit, human),
+        "", "", "", ""
+    ]
+
+    rows = [headers, mem_row, swap_row]
+
+    if show_total:
+        total_total = s["mem_total"] + s["swap_total"]
+        total_used = s["mem_used"] + s["swap_used"]
+        total_free = s["mem_free"] + s["swap_free"]
+        total_row = [
+            "Total:",
+            fmt(total_total, unit, human),
+            fmt(total_used, unit, human),
+            fmt(total_free, unit, human),
+            "", "", "", ""
+        ]
+        rows.append(total_row)
+
+    cols = list(zip(*rows))
+    widths = [max(len(str(x)) for x in col) for col in cols]
+
+    def line(items):
+        return " ".join(str(it).rjust(w) for it, w in zip(items, widths)).rstrip()
+
+    for r in rows:
+        print(line(r))
+
+    if show_details:
+        parts = [
+            f"wired={fmt(s['wired_b'], unit, human)}",
+            f"compressed={fmt(s['compressed_b'], unit, human)}",
+            f"active={fmt(s['active_b'], unit, human)}",
+            f"inactive={fmt(s['inactive_b'], unit, human)}",
+            f"spec={fmt(s['speculative_b'], unit, human)}",
+            f"purgeable={fmt(s['purgeable_b'], unit, human)}",
+        ]
+        print("macOS:", " ".join(parts))
+
+def main() -> int:
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("-h", dest="human", action="store_true", help="human-readable output")
+    ap.add_argument("--help", action="help", help="show this help message and exit")
+    ap.add_argument("--version", action="store_true", help="show version and exit")
+
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("-b", dest="unit", action="store_const", const="b", help="show output in bytes")
+    g.add_argument("-k", dest="unit", action="store_const", const="k", help="show output in kibibytes")
+    g.add_argument("-m", dest="unit", action="store_const", const="m", help="show output in mebibytes")
+    g.add_argument("-g", dest="unit", action="store_const", const="g", help="show output in gibibytes")
+
+    ap.add_argument("-w", dest="wide", action="store_true",
+                    help="wide output (accepted for GNU free compatibility)")
+    ap.add_argument("-t", dest="total", action="store_true", help="display a line with totals")
+    ap.add_argument("-s", dest="seconds", type=float, default=0.0, help="repeat printing every N seconds")
+    ap.add_argument("-c", dest="count", type=int, default=1, help="repeat count with -s, 0 means forever")
+    ap.add_argument("--details", action="store_true", help="show additional macOS breakdown")
+
+    args = ap.parse_args()
+
+    if args.version:
+        print(f"free (macos) {VERSION}")
+        return 0
+
+    unit = args.unit or "h"
+    human = True  # Default to human-readable to match your workflow
+
+    if args.count < 0:
+        print("free: error: -c must be >= 0", file=sys.stderr)
+        return 1
+    if args.seconds < 0:
+        print("free: error: -s must be >= 0", file=sys.stderr)
+        return 1
+    if args.seconds == 0 and args.count == 0:
+        print("free: error: -c 0 requires -s", file=sys.stderr)
+        return 1
+    if args.seconds == 0:
+        args.count = 1
+
+    i = 0
+    while True:
+        s = snapshot()
+        print_table(s, unit=unit, human=human, show_total=args.total, show_details=args.details)
+
+        i += 1
+        if args.count != 0 and i >= args.count:
+            break
+        time.sleep(args.seconds)
+        if args.seconds > 0:
+            print()
+
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
